@@ -183,3 +183,4 @@ func main() {
 	log.Printf("price-engine starting on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
+// Decimal precision
