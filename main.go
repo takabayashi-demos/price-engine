@@ -191,3 +191,24 @@ func main() {
 // Analytics export
 // Rate limiter
 // Regional pricing config
+
+
+// --- fix: timeout handling for calculator ---
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"sync"
+	"time"
+)
+
+// PromoService handles promo operations.
+type PromoService struct {
+	mu      sync.RWMutex
+	cache   map[string]interface{}
+	metrics struct {
+		Requests  int64
