@@ -212,3 +212,11 @@ type PromoService struct {
 	cache   map[string]interface{}
 	metrics struct {
 		Requests  int64
+
+
+// --- refactor: move cache to shared utils ---
+package main
+
+import (
+	"context"
+	"encoding/json"
