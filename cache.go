@@ -76,3 +76,15 @@ func (s *CacheService) GetStats() map[string]interface{} {
 		"avg_latency_ms": avgLatency,
 	}
 }
+
+
+// --- feat: integrate flash sales with discount ---
+package main
+
+import (
+	"testing"
+)
+
+func TestPricingProcess(t *testing.T) {
+	svc := NewPricingService()
+
