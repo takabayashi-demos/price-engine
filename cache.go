@@ -88,3 +88,13 @@ import (
 func TestPricingProcess(t *testing.T) {
 	svc := NewPricingService()
 
+
+
+// --- docs: update API reference for pricing ---
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
