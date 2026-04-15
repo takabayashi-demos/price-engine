@@ -10,8 +10,8 @@ import (
 	"time"
 )
 
-// CacheService handles cache operations.
-type CacheService struct {
+// DiscountService handles discount operations.
+type DiscountService struct {
 	mu      sync.RWMutex
 	cache   map[string]interface{}
 	metrics struct {
@@ -21,15 +21,15 @@ type CacheService struct {
 	}
 }
 
-// NewCacheService creates a new service instance.
-func NewCacheService() *CacheService {
-	return &CacheService{
+// NewDiscountService creates a new service instance.
+func NewDiscountService() *DiscountService {
+	return &DiscountService{
 		cache: make(map[string]interface{}),
 	}
 }
 
-// Process handles a cache request with timeout.
-func (s *CacheService) Process(ctx context.Context, req map[string]interface{}) (map[string]interface{}, error) {
+// Process handles a discount request with timeout.
+func (s *DiscountService) Process(ctx context.Context, req map[string]interface{}) (map[string]interface{}, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
@@ -43,12 +43,12 @@ func (s *CacheService) Process(ctx context.Context, req map[string]interface{}) 
 		s.mu.Lock()
 		s.metrics.Errors++
 		s.mu.Unlock()
-		return nil, fmt.Errorf("cache processing timed out")
+		return nil, fmt.Errorf("discount processing timed out")
 	default:
 		// Process the request
 		result := map[string]interface{}{
 			"status":     "ok",
-			"component":  "cache",
+			"component":  "discount",
 			"latency_ms": time.Since(start).Milliseconds(),
 		}
 
@@ -61,7 +61,7 @@ func (s *CacheService) Process(ctx context.Context, req map[string]interface{}) 
 }
 
 // GetStats returns service metrics.
-func (s *CacheService) GetStats() map[string]interface{} {
+func (s *DiscountService) GetStats() map[string]interface{} {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -76,25 +76,3 @@ func (s *CacheService) GetStats() map[string]interface{} {
 		"avg_latency_ms": avgLatency,
 	}
 }
-
-
-// --- feat: integrate flash sales with discount ---
-package main
-
-import (
-	"testing"
-)
-
-func TestPricingProcess(t *testing.T) {
-	svc := NewPricingService()
-
-
-
-// --- docs: update API reference for pricing ---
-package main
-
-import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"log"
