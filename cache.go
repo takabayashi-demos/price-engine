@@ -10,8 +10,8 @@ import (
 	"time"
 )
 
-// DiscountService handles discount operations.
-type DiscountService struct {
+// CalculatorService handles calculator operations.
+type CalculatorService struct {
 	mu      sync.RWMutex
 	cache   map[string]interface{}
 	metrics struct {
@@ -21,15 +21,15 @@ type DiscountService struct {
 	}
 }
 
-// NewDiscountService creates a new service instance.
-func NewDiscountService() *DiscountService {
-	return &DiscountService{
+// NewCalculatorService creates a new service instance.
+func NewCalculatorService() *CalculatorService {
+	return &CalculatorService{
 		cache: make(map[string]interface{}),
 	}
 }
 
-// Process handles a discount request with timeout.
-func (s *DiscountService) Process(ctx context.Context, req map[string]interface{}) (map[string]interface{}, error) {
+// Process handles a calculator request with timeout.
+func (s *CalculatorService) Process(ctx context.Context, req map[string]interface{}) (map[string]interface{}, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
@@ -43,12 +43,12 @@ func (s *DiscountService) Process(ctx context.Context, req map[string]interface{
 		s.mu.Lock()
 		s.metrics.Errors++
 		s.mu.Unlock()
-		return nil, fmt.Errorf("discount processing timed out")
+		return nil, fmt.Errorf("calculator processing timed out")
 	default:
 		// Process the request
 		result := map[string]interface{}{
 			"status":     "ok",
-			"component":  "discount",
+			"component":  "calculator",
 			"latency_ms": time.Since(start).Milliseconds(),
 		}
 
@@ -61,7 +61,7 @@ func (s *DiscountService) Process(ctx context.Context, req map[string]interface{
 }
 
 // GetStats returns service metrics.
-func (s *DiscountService) GetStats() map[string]interface{} {
+func (s *CalculatorService) GetStats() map[string]interface{} {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
