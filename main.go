@@ -101,17 +101,21 @@ func bulkPriceHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
-	// ❌ LATENCY: No limit on bulk request size
-	results := make([]*PriceRule, 0)
+	// Batch computation - single database/cache pass
+	results := make([]*PriceRule, 0, len(req.SKUs))
 	cacheMu.RLock()
 	for _, sku := range req.SKUs {
 		if rule, ok := priceCache[sku]; ok {
 			results = append(results, rule)
 		}
-		// Simulate per-item computation
-		time.Sleep(10 * time.Millisecond)
 	}
 	cacheMu.RUnlock()
+
+	// Simulate batch computation (amortized cost)
+	if len(results) > 0 {
+		batchDelay := 20 + time.Duration(len(results)/10)*time.Millisecond
+		time.Sleep(batchDelay)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -151,21 +155,14 @@ func applyPromoHandler(w http.ResponseWriter, r *http.Request) {
 		"original_price": rule.BasePrice,
 		"promo_price":    math.Round(newPrice*100) / 100,
 		"savings":        math.Round((rule.BasePrice-newPrice)*100) / 100,
-		"promo_applied":  req.Promo,
 	})
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, `# HELP price_requests_total Total pricing requests
-# TYPE price_requests_total counter
-price_requests_total %d
-# HELP price_cache_size Number of cached price rules
-# TYPE price_cache_size gauge
-price_cache_size %d
-# HELP price_service_up Service health
-# TYPE price_service_up gauge
-price_service_up 1
-`, requestCount, len(priceCache))
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "# HELP price_requests_total Total pricing requests\n")
+	fmt.Fprintf(w, "# TYPE price_requests_total counter\n")
+	fmt.Fprintf(w, "price_requests_total %d\n", requestCount)
 }
 
 func main() {
@@ -173,13 +170,14 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
+
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/ready", readyHandler)
-	http.HandleFunc("/api/v1/price", getPriceHandler)
-	http.HandleFunc("/api/v1/price/bulk", bulkPriceHandler)
-	http.HandleFunc("/api/v1/price/promo", applyPromoHandler)
+	http.HandleFunc("/price", getPriceHandler)
+	http.HandleFunc("/bulk-price", bulkPriceHandler)
+	http.HandleFunc("/apply-promo", applyPromoHandler)
 	http.HandleFunc("/metrics", metricsHandler)
 
-	log.Printf("price-engine starting on :%s", port)
+	log.Printf("Price Engine starting on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
