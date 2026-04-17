@@ -4,7 +4,6 @@
 // INTENTIONAL ISSUES (for demo):
 // - Floating point rounding errors (bug)
 // - Cache stampede vulnerability (bug)
-// - No rate limiting on pricing API (vulnerability)
 package main
 
 import (
@@ -13,10 +12,13 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 type PriceRule struct {
@@ -32,6 +34,10 @@ var (
 	priceCache   = make(map[string]*PriceRule)
 	cacheMu      sync.RWMutex
 	requestCount int64
+
+	// Rate limiting: 100 requests per minute per IP
+	rateLimiters   = make(map[string]*rate.Limiter)
+	rateLimitersMu sync.RWMutex
 )
 
 func init() {
@@ -54,9 +60,84 @@ func init() {
 	}
 }
 
+func getIPAddress(r *http.Request) string {
+	// Check X-Forwarded-For header first (for proxied requests)
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff != "" {
+		ips := parseXForwardedFor(xff)
+		if len(ips) > 0 {
+			return ips[0]
+		}
+	}
+
+	// Fall back to RemoteAddr
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return ip
+}
+
+func parseXForwardedFor(xff string) []string {
+	var ips []string
+	for i := 0; i < len(xff); {
+		end := i
+		for end < len(xff) && xff[end] != ',' {
+			end++
+		}
+		ip := xff[i:end]
+		// Trim spaces
+		for len(ip) > 0 && ip[0] == ' ' {
+			ip = ip[1:]
+		}
+		for len(ip) > 0 && ip[len(ip)-1] == ' ' {
+			ip = ip[:len(ip)-1]
+		}
+		if ip != "" {
+			ips = append(ips, ip)
+		}
+		i = end + 1
+	}
+	return ips
+}
+
+func getRateLimiter(ip string) *rate.Limiter {
+	rateLimitersMu.Lock()
+	defer rateLimitersMu.Unlock()
+
+	limiter, exists := rateLimiters[ip]
+	if !exists {
+		// 100 requests per minute = ~1.67 per second
+		// Using burst of 10 to allow small bursts
+		limiter = rate.NewLimiter(rate.Limit(1.67), 10)
+		rateLimiters[ip] = limiter
+	}
+
+	return limiter
+}
+
+func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ip := getIPAddress(r)
+		limiter := getRateLimiter(ip)
+
+		if !limiter.Allow() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error":       "rate limit exceeded",
+				"retry_after": "60s",
+			})
+			return
+		}
+
+		next(w, r)
+	}
+}
+
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{
-		"status": "UP", "service": "price-engine", "version": "1.4.2",
+		"status": "UP", "service": "price-engine", "version": "1.5.0",
 	})
 }
 
@@ -71,7 +152,6 @@ func getPriceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ❌ BUG: No rate limiting — can be abused for price scraping
 	requestCount++
 
 	cacheMu.RLock()
@@ -151,35 +231,21 @@ func applyPromoHandler(w http.ResponseWriter, r *http.Request) {
 		"original_price": rule.BasePrice,
 		"promo_price":    math.Round(newPrice*100) / 100,
 		"savings":        math.Round((rule.BasePrice-newPrice)*100) / 100,
-		"promo_applied":  req.Promo,
 	})
-}
-
-func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, `# HELP price_requests_total Total pricing requests
-# TYPE price_requests_total counter
-price_requests_total %d
-# HELP price_cache_size Number of cached price rules
-# TYPE price_cache_size gauge
-price_cache_size %d
-# HELP price_service_up Service health
-# TYPE price_service_up gauge
-price_service_up 1
-`, requestCount, len(priceCache))
 }
 
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080"
+		port = "8083"
 	}
+
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/ready", readyHandler)
-	http.HandleFunc("/api/v1/price", getPriceHandler)
-	http.HandleFunc("/api/v1/price/bulk", bulkPriceHandler)
-	http.HandleFunc("/api/v1/price/promo", applyPromoHandler)
-	http.HandleFunc("/metrics", metricsHandler)
+	http.HandleFunc("/price", rateLimitMiddleware(getPriceHandler))
+	http.HandleFunc("/bulk-price", bulkPriceHandler)
+	http.HandleFunc("/promo", applyPromoHandler)
 
-	log.Printf("price-engine starting on :%s", port)
+	log.Printf("Price Engine starting on :%s (rate limiting enabled)", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
