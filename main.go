@@ -4,7 +4,6 @@
 // INTENTIONAL ISSUES (for demo):
 // - Floating point rounding errors (bug)
 // - Cache stampede vulnerability (bug)
-// - No rate limiting on pricing API (vulnerability)
 package main
 
 import (
@@ -13,6 +12,7 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"sync"
@@ -28,13 +28,78 @@ type PriceRule struct {
 	ExpiresAt  string  `json:"expires_at,omitempty"`
 }
 
+type tokenBucket struct {
+	tokens    float64
+	lastCheck time.Time
+	mu        sync.Mutex
+}
+
+type rateLimiter struct {
+	rate      float64
+	burst     int
+	clients   sync.Map
+	cleanup   time.Duration
+}
+
+func newRateLimiter(requestsPerMinute int, burst int) *rateLimiter {
+	rl := &rateLimiter{
+		rate:    float64(requestsPerMinute) / 60.0,
+		burst:   burst,
+		cleanup: 10 * time.Minute,
+	}
+	go rl.cleanupRoutine()
+	return rl
+}
+
+func (rl *rateLimiter) allow(clientIP string) bool {
+	now := time.Now()
+	v, _ := rl.clients.LoadOrStore(clientIP, &tokenBucket{
+		tokens:    float64(rl.burst),
+		lastCheck: now,
+	})
+	bucket := v.(*tokenBucket)
+
+	bucket.mu.Lock()
+	defer bucket.mu.Unlock()
+
+	elapsed := now.Sub(bucket.lastCheck).Seconds()
+	bucket.tokens = math.Min(float64(rl.burst), bucket.tokens+elapsed*rl.rate)
+	bucket.lastCheck = now
+
+	if bucket.tokens >= 1.0 {
+		bucket.tokens -= 1.0
+		return true
+	}
+	return false
+}
+
+func (rl *rateLimiter) cleanupRoutine() {
+	ticker := time.NewTicker(rl.cleanup)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now()
+		rl.clients.Range(func(key, value interface{}) bool {
+			bucket := value.(*tokenBucket)
+			bucket.mu.Lock()
+			if now.Sub(bucket.lastCheck) > rl.cleanup {
+				rl.clients.Delete(key)
+			}
+			bucket.mu.Unlock()
+			return true
+		})
+	}
+}
+
 var (
 	priceCache   = make(map[string]*PriceRule)
 	cacheMu      sync.RWMutex
 	requestCount int64
+	pricingLimiter *rateLimiter
 )
 
 func init() {
+	pricingLimiter = newRateLimiter(100, 10)
+
 	rules := []PriceRule{
 		{SKU: "SKU-001", BasePrice: 599.99, Discount: 15, PromoCode: "TV15OFF"},
 		{SKU: "SKU-002", BasePrice: 999.99, Discount: 0},
@@ -51,6 +116,32 @@ func init() {
 		r.FinalPrice = r.BasePrice * (1 - r.Discount/100)
 		// This produces values like 509.9915 instead of 509.99
 		priceCache[r.SKU] = &r
+	}
+}
+
+func getClientIP(r *http.Request) string {
+	ip := r.Header.Get("X-Forwarded-For")
+	if ip != "" {
+		return ip
+	}
+	ip = r.Header.Get("X-Real-IP")
+	if ip != "" {
+		return ip
+	}
+	ip, _, _ = net.SplitHostPort(r.RemoteAddr)
+	return ip
+}
+
+func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		clientIP := getClientIP(r)
+		if !pricingLimiter.allow(clientIP) {
+			w.Header().Set("Retry-After", "60")
+			w.Header().Set("X-RateLimit-Limit", "100")
+			http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
+			return
+		}
+		next(w, r)
 	}
 }
 
@@ -71,7 +162,6 @@ func getPriceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ❌ BUG: No rate limiting — can be abused for price scraping
 	requestCount++
 
 	cacheMu.RLock()
@@ -151,35 +241,21 @@ func applyPromoHandler(w http.ResponseWriter, r *http.Request) {
 		"original_price": rule.BasePrice,
 		"promo_price":    math.Round(newPrice*100) / 100,
 		"savings":        math.Round((rule.BasePrice-newPrice)*100) / 100,
-		"promo_applied":  req.Promo,
 	})
-}
-
-func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, `# HELP price_requests_total Total pricing requests
-# TYPE price_requests_total counter
-price_requests_total %d
-# HELP price_cache_size Number of cached price rules
-# TYPE price_cache_size gauge
-price_cache_size %d
-# HELP price_service_up Service health
-# TYPE price_service_up gauge
-price_service_up 1
-`, requestCount, len(priceCache))
 }
 
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080"
+		port = "8085"
 	}
+
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/ready", readyHandler)
-	http.HandleFunc("/api/v1/price", getPriceHandler)
-	http.HandleFunc("/api/v1/price/bulk", bulkPriceHandler)
-	http.HandleFunc("/api/v1/price/promo", applyPromoHandler)
-	http.HandleFunc("/metrics", metricsHandler)
+	http.HandleFunc("/price", rateLimitMiddleware(getPriceHandler))
+	http.HandleFunc("/bulk-price", rateLimitMiddleware(bulkPriceHandler))
+	http.HandleFunc("/apply-promo", applyPromoHandler)
 
-	log.Printf("price-engine starting on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	log.Printf("Price Engine starting on port %s", port)
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", port), nil))
 }
