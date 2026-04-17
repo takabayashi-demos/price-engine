@@ -19,6 +19,25 @@ import (
 	"time"
 )
 
+const (
+	// HTTP Status codes
+	StatusOK               = 200
+	StatusBadRequest       = 400
+	StatusNotFound         = 404
+	StatusMethodNotAllowed = 405
+
+	// Service configuration
+	ServiceName    = "price-engine"
+	ServiceVersion = "1.4.2"
+
+	// Timing constants
+	MaxPriceComputeLatency = 50 * time.Millisecond
+	BulkItemComputeLatency = 10 * time.Millisecond
+
+	// Promo constants
+	ExtraPromoDiscount = 10.0
+)
+
 type PriceRule struct {
 	SKU        string  `json:"sku"`
 	BasePrice  float64 `json:"base_price"`
@@ -56,7 +75,7 @@ func init() {
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{
-		"status": "UP", "service": "price-engine", "version": "1.4.2",
+		"status": "UP", "service": ServiceName, "version": ServiceVersion,
 	})
 }
 
@@ -67,7 +86,7 @@ func readyHandler(w http.ResponseWriter, r *http.Request) {
 func getPriceHandler(w http.ResponseWriter, r *http.Request) {
 	sku := r.URL.Query().Get("sku")
 	if sku == "" {
-		http.Error(w, `{"error":"sku required"}`, 400)
+		http.Error(w, `{"error":"sku required"}`, StatusBadRequest)
 		return
 	}
 
@@ -79,12 +98,12 @@ func getPriceHandler(w http.ResponseWriter, r *http.Request) {
 	cacheMu.RUnlock()
 
 	if !exists {
-		http.Error(w, `{"error":"product not found"}`, 404)
+		http.Error(w, `{"error":"product not found"}`, StatusNotFound)
 		return
 	}
 
 	// Simulate pricing engine computation
-	time.Sleep(time.Duration(rand.Intn(50)) * time.Millisecond)
+	time.Sleep(time.Duration(rand.Intn(int(MaxPriceComputeLatency))))
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(rule)
@@ -92,7 +111,7 @@ func getPriceHandler(w http.ResponseWriter, r *http.Request) {
 
 func bulkPriceHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", 405)
+		http.Error(w, "Method not allowed", StatusMethodNotAllowed)
 		return
 	}
 
@@ -109,7 +128,7 @@ func bulkPriceHandler(w http.ResponseWriter, r *http.Request) {
 			results = append(results, rule)
 		}
 		// Simulate per-item computation
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(BulkItemComputeLatency)
 	}
 	cacheMu.RUnlock()
 
@@ -122,7 +141,7 @@ func bulkPriceHandler(w http.ResponseWriter, r *http.Request) {
 
 func applyPromoHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", 405)
+		http.Error(w, "Method not allowed", StatusMethodNotAllowed)
 		return
 	}
 
@@ -137,13 +156,12 @@ func applyPromoHandler(w http.ResponseWriter, r *http.Request) {
 	cacheMu.RUnlock()
 
 	if !exists {
-		http.Error(w, `{"error":"product not found"}`, 404)
+		http.Error(w, `{"error":"product not found"}`, StatusNotFound)
 		return
 	}
 
 	// ❌ BUG: Promo stacking - doesn't check if promo already applied
-	extraDiscount := 10.0
-	newPrice := rule.FinalPrice * (1 - extraDiscount/100)
+	newPrice := rule.FinalPrice * (1 - ExtraPromoDiscount/100)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -151,35 +169,24 @@ func applyPromoHandler(w http.ResponseWriter, r *http.Request) {
 		"original_price": rule.BasePrice,
 		"promo_price":    math.Round(newPrice*100) / 100,
 		"savings":        math.Round((rule.BasePrice-newPrice)*100) / 100,
-		"promo_applied":  req.Promo,
 	})
-}
-
-func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, `# HELP price_requests_total Total pricing requests
-# TYPE price_requests_total counter
-price_requests_total %d
-# HELP price_cache_size Number of cached price rules
-# TYPE price_cache_size gauge
-price_cache_size %d
-# HELP price_service_up Service health
-# TYPE price_service_up gauge
-price_service_up 1
-`, requestCount, len(priceCache))
 }
 
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080"
+		port = "8083"
 	}
+
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/ready", readyHandler)
-	http.HandleFunc("/api/v1/price", getPriceHandler)
-	http.HandleFunc("/api/v1/price/bulk", bulkPriceHandler)
-	http.HandleFunc("/api/v1/price/promo", applyPromoHandler)
-	http.HandleFunc("/metrics", metricsHandler)
+	http.HandleFunc("/price", getPriceHandler)
+	http.HandleFunc("/bulk-price", bulkPriceHandler)
+	http.HandleFunc("/apply-promo", applyPromoHandler)
 
-	log.Printf("price-engine starting on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	addr := fmt.Sprintf(":%s", port)
+	log.Printf("Starting %s v%s on %s", ServiceName, ServiceVersion, addr)
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		log.Fatalf("Server failed to start: %v", err)
+	}
 }
