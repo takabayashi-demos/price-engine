@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"math"
 	"math/rand"
 	"net/http"
@@ -41,9 +42,12 @@ var (
 	priceCache   = make(map[string]*PriceRule)
 	cacheMu      sync.RWMutex
 	requestCount int64
+	logger       *slog.Logger
 )
 
 func init() {
+	logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
 	rules := []PriceRule{
 		{SKU: "SKU-001", BasePrice: 599.99, Discount: 15, PromoCode: "TV15OFF"},
 		{SKU: "SKU-002", BasePrice: 999.99, Discount: 0},
@@ -61,6 +65,7 @@ func init() {
 		// This produces values like 509.9915 instead of 509.99
 		priceCache[r.SKU] = &r
 	}
+	logger.Info("price cache initialized", "rule_count", len(priceCache))
 }
 
 func calculateFinalPrice(basePrice, discountPct float64) float64 {
@@ -88,6 +93,7 @@ func readyHandler(w http.ResponseWriter, r *http.Request) {
 func getPriceHandler(w http.ResponseWriter, r *http.Request) {
 	sku := r.URL.Query().Get("sku")
 	if sku == "" {
+		logger.Warn("missing sku parameter", "remote_addr", r.RemoteAddr)
 		http.Error(w, `{"error":"sku required"}`, 400)
 		return
 	}
@@ -100,6 +106,7 @@ func getPriceHandler(w http.ResponseWriter, r *http.Request) {
 	cacheMu.RUnlock()
 
 	if !exists {
+		logger.Warn("product not found", "sku", sku)
 		http.Error(w, `{"error":"product not found"}`, 404)
 		return
 	}
@@ -107,6 +114,7 @@ func getPriceHandler(w http.ResponseWriter, r *http.Request) {
 	// Simulate pricing engine computation
 	time.Sleep(time.Duration(rand.Intn(maxComputeDelayMs)) * time.Millisecond)
 
+	logger.Info("price retrieved", "sku", sku, "final_price", rule.FinalPrice)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(rule)
 }
@@ -134,6 +142,7 @@ func bulkPriceHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	cacheMu.RUnlock()
 
+	logger.Info("bulk price request", "requested", len(req.SKUs), "found", len(results))
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"prices": results,
@@ -158,6 +167,7 @@ func applyPromoHandler(w http.ResponseWriter, r *http.Request) {
 	cacheMu.RUnlock()
 
 	if !exists {
+		logger.Warn("promo: product not found", "sku", req.SKU, "promo", req.Promo)
 		http.Error(w, `{"error":"product not found"}`, 404)
 		return
 	}
@@ -166,6 +176,7 @@ func applyPromoHandler(w http.ResponseWriter, r *http.Request) {
 	newPrice := calculatePromoPrice(rule.FinalPrice, defaultExtraDiscount)
 	savings := rule.BasePrice - newPrice
 
+	logger.Info("promo applied", "sku", req.SKU, "promo", req.Promo, "new_price", roundPrice(newPrice))
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"sku":            req.SKU,
@@ -187,6 +198,6 @@ func main() {
 	http.HandleFunc("/api/bulk-price", bulkPriceHandler)
 	http.HandleFunc("/api/apply-promo", applyPromoHandler)
 
-	log.Printf("Starting %s v%s on port %s", serviceName, serviceVersion, port)
+	logger.Info("starting price engine", "service", serviceName, "version", serviceVersion, "port", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
