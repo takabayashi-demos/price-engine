@@ -2,7 +2,6 @@
 // Dynamic pricing and promotions with intentional issues.
 //
 // INTENTIONAL ISSUES (for demo):
-// - Floating point rounding errors (bug)
 // - Cache stampede vulnerability (bug)
 // - No rate limiting on pricing API (vulnerability)
 package main
@@ -47,9 +46,8 @@ func init() {
 	}
 	for i := range rules {
 		r := rules[i]
-		// ❌ BUG: Floating point rounding error
-		r.FinalPrice = r.BasePrice * (1 - r.Discount/100)
-		// This produces values like 509.9915 instead of 509.99
+		// Round to 2 decimal places to avoid floating point precision errors
+		r.FinalPrice = math.Round(r.BasePrice*(1-r.Discount/100)*100) / 100
 		priceCache[r.SKU] = &r
 	}
 }
@@ -151,35 +149,21 @@ func applyPromoHandler(w http.ResponseWriter, r *http.Request) {
 		"original_price": rule.BasePrice,
 		"promo_price":    math.Round(newPrice*100) / 100,
 		"savings":        math.Round((rule.BasePrice-newPrice)*100) / 100,
-		"promo_applied":  req.Promo,
 	})
-}
-
-func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, `# HELP price_requests_total Total pricing requests
-# TYPE price_requests_total counter
-price_requests_total %d
-# HELP price_cache_size Number of cached price rules
-# TYPE price_cache_size gauge
-price_cache_size %d
-# HELP price_service_up Service health
-# TYPE price_service_up gauge
-price_service_up 1
-`, requestCount, len(priceCache))
 }
 
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080"
+		port = "8083"
 	}
+
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/ready", readyHandler)
 	http.HandleFunc("/api/v1/price", getPriceHandler)
-	http.HandleFunc("/api/v1/price/bulk", bulkPriceHandler)
-	http.HandleFunc("/api/v1/price/promo", applyPromoHandler)
-	http.HandleFunc("/metrics", metricsHandler)
+	http.HandleFunc("/api/v1/prices/bulk", bulkPriceHandler)
+	http.HandleFunc("/api/v1/promo/apply", applyPromoHandler)
 
-	log.Printf("price-engine starting on :%s", port)
+	log.Printf("Price Engine starting on port %s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
