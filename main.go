@@ -19,6 +19,15 @@ import (
 	"time"
 )
 
+const (
+	serviceName    = "price-engine"
+	serviceVersion = "1.4.2"
+
+	maxComputeDelayMs = 50
+	bulkItemDelayMs   = 10
+	defaultExtraDiscount = 10.0
+)
+
 type PriceRule struct {
 	SKU        string  `json:"sku"`
 	BasePrice  float64 `json:"base_price"`
@@ -48,15 +57,27 @@ func init() {
 	for i := range rules {
 		r := rules[i]
 		// ❌ BUG: Floating point rounding error
-		r.FinalPrice = r.BasePrice * (1 - r.Discount/100)
+		r.FinalPrice = calculateFinalPrice(r.BasePrice, r.Discount)
 		// This produces values like 509.9915 instead of 509.99
 		priceCache[r.SKU] = &r
 	}
 }
 
+func calculateFinalPrice(basePrice, discountPct float64) float64 {
+	return basePrice * (1 - discountPct/100)
+}
+
+func calculatePromoPrice(currentPrice, discountPct float64) float64 {
+	return currentPrice * (1 - discountPct/100)
+}
+
+func roundPrice(price float64) float64 {
+	return math.Round(price*100) / 100
+}
+
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{
-		"status": "UP", "service": "price-engine", "version": "1.4.2",
+		"status": "UP", "service": serviceName, "version": serviceVersion,
 	})
 }
 
@@ -84,7 +105,7 @@ func getPriceHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Simulate pricing engine computation
-	time.Sleep(time.Duration(rand.Intn(50)) * time.Millisecond)
+	time.Sleep(time.Duration(rand.Intn(maxComputeDelayMs)) * time.Millisecond)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(rule)
@@ -109,7 +130,7 @@ func bulkPriceHandler(w http.ResponseWriter, r *http.Request) {
 			results = append(results, rule)
 		}
 		// Simulate per-item computation
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(bulkItemDelayMs * time.Millisecond)
 	}
 	cacheMu.RUnlock()
 
@@ -142,30 +163,16 @@ func applyPromoHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ❌ BUG: Promo stacking - doesn't check if promo already applied
-	extraDiscount := 10.0
-	newPrice := rule.FinalPrice * (1 - extraDiscount/100)
+	newPrice := calculatePromoPrice(rule.FinalPrice, defaultExtraDiscount)
+	savings := rule.BasePrice - newPrice
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"sku":            req.SKU,
 		"original_price": rule.BasePrice,
-		"promo_price":    math.Round(newPrice*100) / 100,
-		"savings":        math.Round((rule.BasePrice-newPrice)*100) / 100,
-		"promo_applied":  req.Promo,
+		"promo_price":    roundPrice(newPrice),
+		"savings":        roundPrice(savings),
 	})
-}
-
-func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, `# HELP price_requests_total Total pricing requests
-# TYPE price_requests_total counter
-price_requests_total %d
-# HELP price_cache_size Number of cached price rules
-# TYPE price_cache_size gauge
-price_cache_size %d
-# HELP price_service_up Service health
-# TYPE price_service_up gauge
-price_service_up 1
-`, requestCount, len(priceCache))
 }
 
 func main() {
@@ -173,13 +180,13 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
+
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/ready", readyHandler)
-	http.HandleFunc("/api/v1/price", getPriceHandler)
-	http.HandleFunc("/api/v1/price/bulk", bulkPriceHandler)
-	http.HandleFunc("/api/v1/price/promo", applyPromoHandler)
-	http.HandleFunc("/metrics", metricsHandler)
+	http.HandleFunc("/api/price", getPriceHandler)
+	http.HandleFunc("/api/bulk-price", bulkPriceHandler)
+	http.HandleFunc("/api/apply-promo", applyPromoHandler)
 
-	log.Printf("price-engine starting on :%s", port)
+	log.Printf("Starting %s v%s on port %s", serviceName, serviceVersion, port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
