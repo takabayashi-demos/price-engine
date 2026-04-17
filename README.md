@@ -12,6 +12,44 @@ The Price Engine service manages product pricing rules, discount calculations, a
 **Language:** Go 1.21+  
 **Framework:** net/http (stdlib)
 
+## Quick Start
+
+### Prerequisites
+
+- Go 1.21 or higher
+- Docker (optional, for containerized deployment)
+
+### Local Development
+
+```bash
+# Clone the repository
+git clone https://github.com/takabayashi-demos/price-engine.git
+cd price-engine
+
+# Run the service
+go run main.go
+
+# Service will start on port 8080
+curl http://localhost:8080/health
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `8080` | HTTP server port |
+| `LOG_LEVEL` | `info` | Logging level (debug, info, warn, error) |
+
+### Docker
+
+```bash
+# Build image
+docker build -t price-engine:latest .
+
+# Run container
+docker run -p 8080:8080 price-engine:latest
+```
+
 ## API Endpoints
 
 ### Health Check
@@ -121,3 +159,73 @@ Content-Type: application/json
   "savings": 141.0
 }
 ```
+
+## Architecture
+
+### Components
+
+- **HTTP Server**: Standard library `net/http` server on port 8080
+- **In-Memory Cache**: Thread-safe price rule cache with `sync.RWMutex`
+- **Price Calculator**: Dynamic pricing engine with discount application
+
+### Data Model
+
+Price rules are stored in-memory and initialized at startup:
+
+```go
+type PriceRule struct {
+    SKU        string  // Product identifier
+    BasePrice  float64 // Original price
+    Discount   float64 // Discount percentage
+    FinalPrice float64 // Calculated price after discount
+    PromoCode  string  // Associated promo code
+    ExpiresAt  string  // Expiration timestamp
+}
+```
+
+### Performance Characteristics
+
+- **Cache Lookup**: O(1) average case
+- **Single Price Query**: ~50ms average (includes simulated computation)
+- **Bulk Query**: ~10ms per SKU
+- **Concurrency**: Read-heavy workload optimized with `RWMutex`
+
+## Known Issues
+
+This service contains intentional issues for demonstration purposes:
+
+1. **Floating-point rounding errors** in price calculations
+2. **No rate limiting** on pricing API endpoints
+3. **Cache stampede vulnerability** under high load
+4. **Promo stacking bug** allows multiple discounts on same SKU
+5. **No size limits** on bulk price requests
+
+These issues are tracked and will be addressed in future releases.
+
+## Testing
+
+```bash
+# Run unit tests
+go test ./...
+
+# Run with coverage
+go test -cover ./...
+
+# Example API test
+curl -X POST http://localhost:8080/bulk-price \
+  -H "Content-Type: application/json" \
+  -d '{"skus": ["SKU-001", "SKU-003"]}'
+```
+
+## Deployment
+
+The service is deployed to Kubernetes with the following resources:
+
+- **Deployment**: 3 replicas for high availability
+- **Service**: ClusterIP on port 8080
+- **Health Probes**: `/health` (liveness) and `/ready` (readiness)
+- **Resource Limits**: 256Mi memory, 200m CPU
+
+## Support
+
+For issues or questions, contact the Pricing team or file a ticket in the internal support portal.
