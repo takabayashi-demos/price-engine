@@ -4,7 +4,6 @@
 // INTENTIONAL ISSUES (for demo):
 // - Floating point rounding errors (bug)
 // - Cache stampede vulnerability (bug)
-// - No rate limiting on pricing API (vulnerability)
 package main
 
 import (
@@ -13,10 +12,13 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 type PriceRule struct {
@@ -28,10 +30,17 @@ type PriceRule struct {
 	ExpiresAt  string  `json:"expires_at,omitempty"`
 }
 
+type visitor struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
 var (
 	priceCache   = make(map[string]*PriceRule)
 	cacheMu      sync.RWMutex
 	requestCount int64
+	visitors     = make(map[string]*visitor)
+	visitorsMu   sync.RWMutex
 )
 
 func init() {
@@ -52,6 +61,61 @@ func init() {
 		// This produces values like 509.9915 instead of 509.99
 		priceCache[r.SKU] = &r
 	}
+
+	// Start cleanup goroutine for stale visitors
+	go cleanupVisitors()
+}
+
+func getVisitor(ip string) *rate.Limiter {
+	visitorsMu.Lock()
+	defer visitorsMu.Unlock()
+
+	v, exists := visitors[ip]
+	if !exists {
+		// 10 requests per second with burst of 20
+		limiter := rate.NewLimiter(10, 20)
+		visitors[ip] = &visitor{limiter, time.Now()}
+		return limiter
+	}
+
+	v.lastSeen = time.Now()
+	return v.limiter
+}
+
+func cleanupVisitors() {
+	for {
+		time.Sleep(5 * time.Minute)
+		visitorsMu.Lock()
+		for ip, v := range visitors {
+			if time.Since(v.lastSeen) > 10*time.Minute {
+				delete(visitors, ip)
+			}
+		}
+		visitorsMu.Unlock()
+	}
+}
+
+func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ip, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			ip = r.RemoteAddr
+		}
+
+		// Check X-Forwarded-For for proxied requests
+		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+			ip = forwarded
+		}
+
+		limiter := getVisitor(ip)
+		if !limiter.Allow() {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
+			return
+		}
+
+		next(w, r)
+	}
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -71,7 +135,6 @@ func getPriceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ❌ BUG: No rate limiting — can be abused for price scraping
 	requestCount++
 
 	cacheMu.RLock()
@@ -151,21 +214,16 @@ func applyPromoHandler(w http.ResponseWriter, r *http.Request) {
 		"original_price": rule.BasePrice,
 		"promo_price":    math.Round(newPrice*100) / 100,
 		"savings":        math.Round((rule.BasePrice-newPrice)*100) / 100,
-		"promo_applied":  req.Promo,
+		"promo_code":     req.Promo,
 	})
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, `# HELP price_requests_total Total pricing requests
-# TYPE price_requests_total counter
-price_requests_total %d
-# HELP price_cache_size Number of cached price rules
-# TYPE price_cache_size gauge
-price_cache_size %d
-# HELP price_service_up Service health
-# TYPE price_service_up gauge
-price_service_up 1
-`, requestCount, len(priceCache))
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"requests_total": requestCount,
+		"cache_size":     len(priceCache),
+	})
 }
 
 func main() {
@@ -173,13 +231,14 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
+
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/ready", readyHandler)
-	http.HandleFunc("/api/v1/price", getPriceHandler)
-	http.HandleFunc("/api/v1/price/bulk", bulkPriceHandler)
-	http.HandleFunc("/api/v1/price/promo", applyPromoHandler)
+	http.HandleFunc("/price", rateLimitMiddleware(getPriceHandler))
+	http.HandleFunc("/bulk-price", rateLimitMiddleware(bulkPriceHandler))
+	http.HandleFunc("/apply-promo", applyPromoHandler)
 	http.HandleFunc("/metrics", metricsHandler)
 
-	log.Printf("price-engine starting on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	log.Printf("Price Engine starting on port %s", port)
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", port), nil))
 }
