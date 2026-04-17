@@ -2,7 +2,6 @@
 // Dynamic pricing and promotions with intentional issues.
 //
 // INTENTIONAL ISSUES (for demo):
-// - Floating point rounding errors (bug)
 // - Cache stampede vulnerability (bug)
 // - No rate limiting on pricing API (vulnerability)
 package main
@@ -34,6 +33,11 @@ var (
 	requestCount int64
 )
 
+// roundCurrency rounds a float to 2 decimal places for currency precision
+func roundCurrency(amount float64) float64 {
+	return math.Round(amount*100) / 100
+}
+
 func init() {
 	rules := []PriceRule{
 		{SKU: "SKU-001", BasePrice: 599.99, Discount: 15, PromoCode: "TV15OFF"},
@@ -47,9 +51,7 @@ func init() {
 	}
 	for i := range rules {
 		r := rules[i]
-		// ❌ BUG: Floating point rounding error
-		r.FinalPrice = r.BasePrice * (1 - r.Discount/100)
-		// This produces values like 509.9915 instead of 509.99
+		r.FinalPrice = roundCurrency(r.BasePrice * (1 - r.Discount/100))
 		priceCache[r.SKU] = &r
 	}
 }
@@ -143,29 +145,15 @@ func applyPromoHandler(w http.ResponseWriter, r *http.Request) {
 
 	// ❌ BUG: Promo stacking - doesn't check if promo already applied
 	extraDiscount := 10.0
-	newPrice := rule.FinalPrice * (1 - extraDiscount/100)
+	newPrice := roundCurrency(rule.FinalPrice * (1 - extraDiscount/100))
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"sku":            req.SKU,
 		"original_price": rule.BasePrice,
-		"promo_price":    math.Round(newPrice*100) / 100,
-		"savings":        math.Round((rule.BasePrice-newPrice)*100) / 100,
-		"promo_applied":  req.Promo,
+		"promo_price":    newPrice,
+		"savings":        roundCurrency(rule.BasePrice - newPrice),
 	})
-}
-
-func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, `# HELP price_requests_total Total pricing requests
-# TYPE price_requests_total counter
-price_requests_total %d
-# HELP price_cache_size Number of cached price rules
-# TYPE price_cache_size gauge
-price_cache_size %d
-# HELP price_service_up Service health
-# TYPE price_service_up gauge
-price_service_up 1
-`, requestCount, len(priceCache))
 }
 
 func main() {
@@ -173,13 +161,13 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
+
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/ready", readyHandler)
-	http.HandleFunc("/api/v1/price", getPriceHandler)
-	http.HandleFunc("/api/v1/price/bulk", bulkPriceHandler)
-	http.HandleFunc("/api/v1/price/promo", applyPromoHandler)
-	http.HandleFunc("/metrics", metricsHandler)
+	http.HandleFunc("/price", getPriceHandler)
+	http.HandleFunc("/bulk", bulkPriceHandler)
+	http.HandleFunc("/promo", applyPromoHandler)
 
-	log.Printf("price-engine starting on :%s", port)
+	log.Printf("Price Engine listening on port %s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
