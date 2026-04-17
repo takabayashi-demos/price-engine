@@ -41,6 +41,11 @@ var (
 	requestCount int64
 )
 
+// calculateDiscountedPrice applies a discount percentage to a base price
+func calculateDiscountedPrice(basePrice, discountPct float64) float64 {
+	return basePrice * (1 - discountPct/100)
+}
+
 func init() {
 	rules := []PriceRule{
 		{SKU: "SKU-001", BasePrice: 599.99, Discount: 15, PromoCode: "TV15OFF"},
@@ -55,7 +60,7 @@ func init() {
 	for i := range rules {
 		r := rules[i]
 		// ❌ BUG: Floating point rounding error
-		r.FinalPrice = r.BasePrice * (1 - r.Discount/100)
+		r.FinalPrice = calculateDiscountedPrice(r.BasePrice, r.Discount)
 		// This produces values like 509.9915 instead of 509.99
 		priceCache[r.SKU] = &r
 	}
@@ -154,7 +159,7 @@ func applyPromoHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ❌ BUG: Promo stacking - doesn't check if promo already applied
-	newPrice := rule.FinalPrice * (1 - extraPromoDiscount/100)
+	newPrice := calculateDiscountedPrice(rule.FinalPrice, extraPromoDiscount)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
