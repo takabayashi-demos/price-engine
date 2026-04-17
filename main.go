@@ -19,6 +19,25 @@ import (
 	"time"
 )
 
+const (
+	// HTTP Status codes
+	StatusOK               = 200
+	StatusBadRequest       = 400
+	StatusNotFound         = 404
+	StatusMethodNotAllowed = 405
+
+	// Service configuration
+	ServiceName    = "price-engine"
+	ServiceVersion = "1.4.2"
+
+	// Timing constants
+	MaxPriceComputeLatency = 50 * time.Millisecond
+	BulkItemComputeLatency = 10 * time.Millisecond
+
+	// Promo constants
+	ExtraPromoDiscount = 10.0
+)
+
 type PriceRule struct {
 	SKU        string  `json:"sku"`
 	BasePrice  float64 `json:"base_price"`
@@ -32,9 +51,12 @@ var (
 	priceCache   = make(map[string]*PriceRule)
 	cacheMu      sync.RWMutex
 	requestCount int64
+	logger       *log.Logger
 )
 
 func init() {
+	logger = log.New(os.Stdout, "[price-engine] ", log.LstdFlags|log.Lmsgprefix)
+
 	rules := []PriceRule{
 		{SKU: "SKU-001", BasePrice: 599.99, Discount: 15, PromoCode: "TV15OFF"},
 		{SKU: "SKU-002", BasePrice: 999.99, Discount: 0},
@@ -52,22 +74,38 @@ func init() {
 		// This produces values like 509.9915 instead of 509.99
 		priceCache[r.SKU] = &r
 	}
+	logger.Printf("Loaded %d price rules into cache", len(priceCache))
+}
+
+func respondJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		logger.Printf("ERROR: failed to encode JSON response: %v", err)
+	}
+}
+
+func respondError(w http.ResponseWriter, status int, message string) {
+	respondJSON(w, status, map[string]string{"error": message})
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]string{
-		"status": "UP", "service": "price-engine", "version": "1.4.2",
+	respondJSON(w, StatusOK, map[string]string{
+		"status":  "UP",
+		"service": ServiceName,
+		"version": ServiceVersion,
 	})
 }
 
 func readyHandler(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]string{"status": "READY"})
+	respondJSON(w, StatusOK, map[string]string{"status": "READY"})
 }
 
 func getPriceHandler(w http.ResponseWriter, r *http.Request) {
 	sku := r.URL.Query().Get("sku")
 	if sku == "" {
-		http.Error(w, `{"error":"sku required"}`, 400)
+		logger.Printf("WARN: getPriceHandler called without SKU")
+		respondError(w, StatusBadRequest, "sku required")
 		return
 	}
 
@@ -79,27 +117,32 @@ func getPriceHandler(w http.ResponseWriter, r *http.Request) {
 	cacheMu.RUnlock()
 
 	if !exists {
-		http.Error(w, `{"error":"product not found"}`, 404)
+		logger.Printf("WARN: SKU not found: %s", sku)
+		respondError(w, StatusNotFound, "product not found")
 		return
 	}
 
 	// Simulate pricing engine computation
-	time.Sleep(time.Duration(rand.Intn(50)) * time.Millisecond)
+	time.Sleep(time.Duration(rand.Intn(int(MaxPriceComputeLatency))))
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(rule)
+	logger.Printf("INFO: Price retrieved for SKU=%s, price=%.2f", sku, rule.FinalPrice)
+	respondJSON(w, StatusOK, rule)
 }
 
 func bulkPriceHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", 405)
+		respondError(w, StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
 
 	var req struct {
 		SKUs []string `json:"skus"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		logger.Printf("ERROR: failed to decode bulk price request: %v", err)
+		respondError(w, StatusBadRequest, "invalid request body")
+		return
+	}
 
 	// ❌ LATENCY: No limit on bulk request size
 	results := make([]*PriceRule, 0)
@@ -109,12 +152,12 @@ func bulkPriceHandler(w http.ResponseWriter, r *http.Request) {
 			results = append(results, rule)
 		}
 		// Simulate per-item computation
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(BulkItemComputeLatency)
 	}
 	cacheMu.RUnlock()
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	logger.Printf("INFO: Bulk price request processed: %d SKUs requested, %d found", len(req.SKUs), len(results))
+	respondJSON(w, StatusOK, map[string]interface{}{
 		"prices": results,
 		"total":  len(results),
 	})
@@ -122,7 +165,7 @@ func bulkPriceHandler(w http.ResponseWriter, r *http.Request) {
 
 func applyPromoHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", 405)
+		respondError(w, StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
 
@@ -130,56 +173,49 @@ func applyPromoHandler(w http.ResponseWriter, r *http.Request) {
 		SKU   string `json:"sku"`
 		Promo string `json:"promo_code"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		logger.Printf("ERROR: failed to decode promo request: %v", err)
+		respondError(w, StatusBadRequest, "invalid request body")
+		return
+	}
 
 	cacheMu.RLock()
 	rule, exists := priceCache[req.SKU]
 	cacheMu.RUnlock()
 
 	if !exists {
-		http.Error(w, `{"error":"product not found"}`, 404)
+		logger.Printf("WARN: Promo applied to non-existent SKU: %s", req.SKU)
+		respondError(w, StatusNotFound, "product not found")
 		return
 	}
 
 	// ❌ BUG: Promo stacking - doesn't check if promo already applied
-	extraDiscount := 10.0
-	newPrice := rule.FinalPrice * (1 - extraDiscount/100)
+	newPrice := rule.FinalPrice * (1 - ExtraPromoDiscount/100)
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	logger.Printf("INFO: Promo applied: SKU=%s, promo=%s, new_price=%.2f", req.SKU, req.Promo, newPrice)
+	respondJSON(w, StatusOK, map[string]interface{}{
 		"sku":            req.SKU,
 		"original_price": rule.BasePrice,
 		"promo_price":    math.Round(newPrice*100) / 100,
 		"savings":        math.Round((rule.BasePrice-newPrice)*100) / 100,
-		"promo_applied":  req.Promo,
 	})
-}
-
-func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, `# HELP price_requests_total Total pricing requests
-# TYPE price_requests_total counter
-price_requests_total %d
-# HELP price_cache_size Number of cached price rules
-# TYPE price_cache_size gauge
-price_cache_size %d
-# HELP price_service_up Service health
-# TYPE price_service_up gauge
-price_service_up 1
-`, requestCount, len(priceCache))
 }
 
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080"
+		port = "8083"
 	}
+
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/ready", readyHandler)
-	http.HandleFunc("/api/v1/price", getPriceHandler)
-	http.HandleFunc("/api/v1/price/bulk", bulkPriceHandler)
-	http.HandleFunc("/api/v1/price/promo", applyPromoHandler)
-	http.HandleFunc("/metrics", metricsHandler)
+	http.HandleFunc("/price", getPriceHandler)
+	http.HandleFunc("/bulk-price", bulkPriceHandler)
+	http.HandleFunc("/apply-promo", applyPromoHandler)
 
-	log.Printf("price-engine starting on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	addr := fmt.Sprintf(":%s", port)
+	logger.Printf("Starting %s v%s on %s", ServiceName, ServiceVersion, addr)
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		logger.Fatalf("Server failed to start: %v", err)
+	}
 }
